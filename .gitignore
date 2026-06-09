@@ -1,0 +1,5 @@
+# cpstamped backups
+*.[12][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]
+
+# compiled binary artifact
+*.bin
