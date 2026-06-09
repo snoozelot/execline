@@ -1,5 +1,5 @@
-execline — 46 commands, one binary
-====================================
+execline —  Chain-loading command language
+==========================================
 
 execline is a chain-loading command language. Each command modifies
 process state (env, fds, cwd, signals) and hands control to the next
@@ -10,444 +10,582 @@ remainder to the next handler.
 This is not a shell.  No parser, no glob expansion, no word splitting.
 Commands receive argv already split by the caller.
 
-```
-  ./execline.c                                    \
-      define    MSG hello                         \
-      /bin/echo '$MSG'
-```
+Pipe echo output through a reader loop:
+
+```
+  ./execline.c                             \
+      pipeline  /bin/echo 'hello execline' \
+      ''                                   \
+      forstdin  LINE                       \
+          importas  MSG LINE               \
+          /bin/echo 'got: $MSG'
+```
+
+`pipeline` forks the block (`echo`) and connects its stdout to
+the next command's stdin.  `forstdin` reads each line, sets the
+`LINE` env var.  `importas` brings `LINE` into argv substitution
+as `$MSG`.  Every step runs in the same process — no exec between
+execline commands.
+
+Block arguments (like `echo hello execline` above) are terminated
+by an empty string `''` — that is how blocks work in flat argv.
+`execlineb` scripts use `{ }` syntax instead; see execlineb(1).
+
+Quick reference
+---------------
+
+## Environment
+
+| Command | What it does |
+|---------|--------------|
+| [export](#export) | setenv(key, val) |
+| [unexport](#unexport) | unsetenv(key) |
+| [empty](#empty) | unset named vars; `-P` clears special vars |
+| [emptyenv](#emptyenv) | clear entire env; `-P` preserves special vars |
+| [envfile](#envfile) | load `KEY=val` from a file (default `./env`) |
+
+## Substitution
+
+| Command | What it does |
+|---------|--------------|
+| [define](#define) | replace `$KEY` / `${KEY}` with value in remaining argv |
+| [importas](#importas) | read env var, substitute `$VAR` |
+| [multidefine](#multidefine) | define multiple key/value pairs, substitute simultaneously |
+| [multisubstitute](#multisubstitute) | collect define/importas/elglob in a block, apply all at once |
 
-`define` takes 2 args (MSG, hello), substitutes `$MSG` in the
-remaining argv.  `echo` receives `hello`.
+## Conditional execution
 
-```
-  ./execline.c                                    \
-      export    PATH /usr/local/bin:/usr/bin:/bin \
-      foreground { echo building }                \
-      make all
-```
+| Command | What it does |
+|---------|--------------|
+| [if](#if) | run block; exits 0 → run chain |
+| [ifelse](#ifelse) | three blocks: condition, then, else |
+| [ifthenelse](#ifthenelse) | three blocks + rest chain |
+| [foreground](#foreground) | run block in child, wait |
+| [background](#background) | fork block, continue immediately |
+| [pipeline](#pipeline) | run block with stdout → next stdin |
+| [piperw](#piperw) | create a pipe on two fds |
 
-`export` sets PATH.  `foreground` runs the block and waits.
-`make all` runs.  State persists — no exec between steps.
+## I/O redirection
 
-```
-  ./execline.c                                    \
-      backtick  OUTPUT { /bin/echo data }         \
-      importas  VAL OUTPUT                        \
-      /bin/echo '$VAL'
-```
+| Command | What it does |
+|---------|--------------|
+| [redirfd](#redirfd) | open file, dup2 to target fd |
+| [fdmove](#fdmove) | dup2(old, new) |
+| [fdclose](#fdclose) | close(fd) |
+| [fdreserve](#fdreserve) | ensure fd closed, open /dev/null on it |
+| [fdswap](#fdswap) | swap two fds via intermediate dup |
+| [fdblock](#fdblock) | clear O_NONBLOCK on fd |
+| [heredoc](#heredoc) | write block to temp file, feed as stdin |
+| [withstdinas](#withstdinas) | open file, dup2 to fd 0 |
 
-`backtick` captures output into `$OUTPUT`.  `importas` reads it
-back.  `echo` prints the captured value.
+## Data capture
 
-46 commands
------------
+| Command | What it does |
+|---------|--------------|
+| [backtick](#backtick) | run block, capture stdout, store in env var |
+| [forbacktickx](#forbacktickx) | run generator, split output, iterate |
+| [forx](#forx) | iterate over literal values from a block |
+| [forstdin](#forstdin) | read stdin line by line, iterate |
 
-### Environment
+## Process management
 
-```
-  ./execline.c                                    \
-      export    FOO hello                         \
-      importas  VAL FOO                           \
-      /bin/echo '$VAL'
-```
+| Command | What it does |
+|---------|--------------|
+| [exec](#exec) | replace the process |
+| [tryexec](#tryexec) | attempt exec; on failure chain continues |
+| [wait](#wait) | wait for children |
+| [trap](#trap) | install signal handlers in-process |
+| [exit](#exit) | exit with given code (default 0) |
 
-**export** — setenv(var, value).  `importas` reads FOO from the
-environment, substitutes `$VAL`.  **unexport** — unsetenv(var).
-**empty** — unset named vars; `-P` clears `#`, `0`-`9`, `?`, `!`.
-**emptyenv** — clear entire env; `-P` preserves special vars.
-**envfile** — load `KEY=val` lines from a file (default: `./env`).
+## Information
 
-### Substitution
+| Command | What it does |
+|---------|--------------|
+| [getpid](#getpid) | store PID in env var |
+| [getcwd](#getcwd) | store cwd in env var |
+| [dollarat](#dollarat) | print positional params |
+| [eltest](#eltest) | inline POSIX test(1), no fork |
+| [elglob](#elglob) | glob pattern, store results in env var |
+| [case](#case) | fnmatch value against patterns |
 
-```
-  ./execline.c                                    \
-      define    FOO hello                         \
-      /bin/echo '$FOO world'
-```
+## Directory and mask
 
-**define** — replace `$KEY` or `${KEY}` with VALUE in remaining argv.
-`-s` splits value on delimiter (one word per element).  `-C` crunches
-consecutive delimiters.  `-d delim` sets delimiter.  Backslash quoting:
-odd count before `$KEY` = literal; even count = substitute, keep half.
+| Command | What it does |
+|---------|--------------|
+| [cd](#cd) | chdir + update PWD |
+| [posix-cd](#posix-cd) | chdir only, no PWD update |
+| [umask](#umask) | set file creation mask (octal) |
+| [posix-umask](#posix-umask) | same, no frills |
 
-```
-  ./execline.c                                    \
-      importas  VAL FOO                           \
-      /bin/echo '$VAL'
-```
+## Scripting
 
-**importas** — read env var FOO, substitute `$VAL` with its value.
-`-D default` when unset.  `-i` insists (errors if unset).  `-u` unsets
-the source var after reading.
+| Command | What it does |
+|---------|--------------|
+| [execlineb](#execlineb) | parse execline script text |
+| [runblock](#runblock) | run block with up to N positional args |
+| [elgetpositionals](#elgetpositionals) | collect env `$N..$M` into var |
 
-```
-  ./execline.c                                    \
-      multidefine A prefixA B prefixB --          \
-      /bin/echo '$A/$B'
-```
+Commands
+--------
 
-**multidefine** — define multiple key/value pairs (end at `--`),
-substitute simultaneously.
+## export
 
-```
-  ./execline.c                                    \
-      multisubstitute                             \
-          define    A x                           \
-          define    B y                           \
-      ''                                          \
-      /bin/echo '$A $B'
-```
+`export [ -D default ] [ -i ] key val prog...`
 
-**multisubstitute** — collect define/importas/elglob in a block
-(terminated by `''`), apply all substitutions at once to the prog.
+Set environment variable `key` to `val`.  If `key` is already set,
+it is overwritten.
 
-### Conditional execution
+- `-D default` — set a fallback value if `key` is unset
+- `-i` — error if `key` is not found
 
-```
-  ./execline.c                                    \
-      if        /bin/test -d /tmp                 \
-      ''                                          \
-      /bin/echo '/tmp exists'
-```
+**Example:** `export FOO hello /bin/echo '$FOO'`
 
-**if** — run a block.  If it exits 0, run the chain.  `-n` inverts.
-`-t CODE` / `-x CODE` match specific exit codes.  Sets `?`.
+## unexport
 
-```
-  ./execline.c                                    \
-      ifelse    /bin/test -d /tmp                 \
-      ''                                          \
-      /bin/echo '/tmp exists'                     \
-      ''                                          \
-      /bin/echo '/tmp missing'
-```
+`unexport key prog...`
 
-**ifelse** — three blocks: condition, then, else.
+Unset environment variable `key`.
 
-```
-  ./execline.c                                    \
-      ifthenelse                                  \
-          /bin/test -f /tmp/foo                   \
-      ''                                          \
-          /bin/echo 'exists'                      \
-      ''                                          \
-          /bin/echo 'missing'                     \
-      ''                                          \
-      /bin/echo 'checked'
-```
+## empty
 
-**ifthenelse** — three blocks (condition, then, else) and a rest
-chain that runs regardless.
+`empty [ -P ] var... prog...`
 
-```
-  ./execline.c                                    \
-      foreground { /bin/echo hello }              \
-      /bin/echo world
-```
+Unset one or more named environment variables.
 
-**foreground** — run a block in a child, wait, set `?` to exit code,
-continue.
+- `-P` — also clear special internal vars `#`, `0`-`9`, `?`, `!`
 
-```
-  ./execline.c                                    \
-      background { sleep 5 }                      \
-      /bin/echo 'immediate'
-```
+## emptyenv
 
-**background** — fork a block, continue immediately.  Sets `!` to
-child PID.
+`emptyenv [ -P ] prog...`
 
-```
-  ./execline.c                                    \
-      pipeline { /bin/echo data }                 \
-      tr '[:lower:]' '[:upper:]'
-```
+Clear the entire environment.
 
-**pipeline** — run block with stdout connected to next command's
-stdin.
+- `-P` — preserve `PATH` and the internal state vars `#`,
+  `0`-`9`, `?`, `!`
 
-```
-  ./execline.c                                    \
-      fdclose   7                                 \
-      fdclose   8                                 \
-      piperw    7 8                               \
-      /bin/echo ok
-```
+## envfile
 
-**piperw** — create a pipe on two specified file descriptors.
+`envfile [ -i | -I ] [ file ] prog...`
 
-### I/O redirection
+Read a file of `KEY=value` assignments (default `./env`) and export
+each pair into the environment.  Supports bash-style comments (`#`),
+line continuations (`\`), and quoted values (`"` and `'`).
 
-```
-  ./execline.c                                    \
-      redirfd   -w 1 /tmp/out.txt                 \
-      /bin/echo hello
-```
+- `-i` — error if file is missing (default)
+- `-I` — silently skip if file is missing
+- `-` as file reads from stdin
 
-**redirfd** — open a file and dup2 to target fd.
-`-r` (read), `-w` (write/trunc), `-a` (append), `-u` (rw),
-`-x` (excl create).  `-n` sets O_NONBLOCK.  `-b` toggles blocking.
+## define
 
-```
-  ./execline.c                                    \
-      fdmove    1 2                               \
-      /bin/echo ok
-```
+`define [ -s [ -C ] [ -d delim ] ] key val prog...`
 
-**fdmove** — dup2(old, new).  `-c` closes old fd after move.
+Replace `$KEY` or `${KEY}` with `val` in the remaining argv.
 
-```
-  ./execline.c                                    \
-      fdclose   9                                 \
-      /bin/echo ok
-```
+- `-s` — split `val` on delimiter, producing one word per element
+- `-C` — crunch consecutive delimiters (implies `-s`)
+- `-d delim` — set the split delimiter (default: whitespace)
 
-**fdclose** — close(fd).
+Backslash quoting: an odd number of backslashes before `$KEY` makes
+it literal; an even number substitutes and keeps half the backslashes.
 
-```
-  ./execline.c                                    \
-      fdreserve 7                                 \
-      /bin/echo ok
-```
+**Example:** `define MSG hello /bin/echo '$MSG'`
 
-**fdreserve** — ensure fd closed, open /dev/null on it.
+## importas
 
-```
-  ./execline.c                                    \
-      fdreserve 7  fdreserve 8                    \
-      fdswap    7  8                              \
-      /bin/echo ok
-```
+`importas [ -D default ] [ -i ] [ -u ] var key prog...`
 
-**fdswap** — swap two fds via intermediate dup.
+Read environment variable `key` and substitute `$var` with its value
+in the remaining argv.
 
-```
-  ./execline.c                                    \
-      fdblock   0                                 \
-      /bin/echo ok
-```
+- `-D default` — use this value if `key` is unset
+- `-i` — insist: error if `key` is not found
+- `-u` — unset `key` from the environment after reading
 
-**fdblock** — clear O_NONBLOCK on a fd.
+## multidefine
 
-```
-  ./execline.c                                    \
-      heredoc   hello                             \
-      ''                                          \
-      tr '[:lower:]' '[:upper:]'
-```
+`multidefine key val key2 val2 ... -- prog...`
 
-**heredoc** — write block content (joined by newlines) to temp file,
-feed as stdin.
+Define multiple key/value pairs, ending at `--`.  All substitutions
+are applied simultaneously to the remaining argv.
 
-```
-  ./execline.c                                    \
-      withstdinas /tmp/data.txt                   \
-      tr '[:lower:]' '[:upper:]'
-```
+## multisubstitute
 
-**withstdinas** — open file, dup2 to fd 0 (stdin).
+`multisubstitute { define ... | importas ... | elglob ... } '' prog...`
 
-### Data capture
+Collect define/importas/elglob commands inside a block (terminated
+by `''`).  All substitutions are applied simultaneously to the prog.
 
-```
-  ./execline.c                                    \
-      backtick  OUTPUT { /bin/echo data }         \
-      importas  VAL OUTPUT                        \
-      /bin/echo '$VAL'
-```
+## if
 
-**backtick** — run block, capture stdout, strip trailing newline,
-store in env var.  `-0` for null-delimited.  `-D default` on failure.
-`-i` / `-I` / `-x` control behavior on subprocess exit.
+`if [ -n ] [ -t code ] [ -x code ] { block } '' prog...`
 
-```
-  ./execline.c                                    \
-      forbacktickx VAR { /bin/echo -e 'a\\nb' }   \
-      ''                                          \
-      importas  VAL VAR                           \
-      /bin/echo '$VAL'
-```
+Run `block`.  If it exits 0, execute the chain.  Sets `?` to the
+exit code.
 
-**forbacktickx** — run generator, split output (newline or `-0`),
-iterate.  Each value sets VAR, runs loop body.  `-o` / `-x` filter
-on exit codes.
+- `-n` — invert: run chain if block exits non-zero
+- `-t code` — match specific exit code
+- `-x code` — match specific exit code (inverted sense)
 
-```
-  ./execline.c                                    \
-      forx      VAR a b                           \
-      ''                                          \
-      importas  VAL VAR                           \
-      /bin/echo '$VAL'
-```
+**Example:** `if /bin/test -d /tmp '' /bin/echo '/tmp exists'`
 
-**forx** — iterate over literal values from a block.
-Each value sets VAR, runs loop body.
+## ifelse
 
-```
-  /bin/echo -e 'a\\nb'                            \
-      | ./execline.c                              \
-          forstdin  VAR                           \
-          importas  VAL VAR                       \
-          /bin/echo '$VAL'
-```
+`ifelse { condition } '' { then-block } '' { else-block } '' prog...`
 
-**forstdin** — read stdin line by line (or `-0` records), iterate.
-Each line sets VAR, runs loop body.  `-w` strips whitespace.
-`-W` squeezes internal whitespace.
+Three blocks: condition, then, else.  If condition exits 0, run
+then-block; otherwise run else-block.  Then run prog.
 
-### Process management
+## ifthenelse
 
-```
-  ./execline.c                                    \
-      exec      /bin/echo hello world
-```
+`ifthenelse { condition } '' { then-block } '' { else-block } '' prog...`
 
-**exec** — replace the process.  `-c` clears env.  `-l` prepends `-`
-to argv[0] (login shell).  `-a argv0` sets argv[0].
+Same as ifelse, but prog runs regardless of which branch executed.
 
-```
-  ./execline.c                                    \
-      tryexec   /nonexistent                      \
-      /bin/echo fallback
-```
+## foreground
 
-**tryexec** — attempt exec; on failure, chain continues with the
-remaining argv (skipping the failed program).
+`foreground { block } prog...`
 
-```
-  ./execline.c                                    \
-      background { sleep 1 }                      \
-      wait
-```
+Run `block` in a child process and wait for it to finish.  Sets `?`
+to the child's exit code.  Then run prog.
 
-**wait** — wait for children.  Accepts a block of PIDs.  `-t timeout`
-uses SIGALRM.  `-I` silently handles no-children errors.
+**Example:** `foreground { /bin/echo hello } /bin/echo world`
 
-```
-  ./execline.c                                    \
-      trap                                        \
-          USR1  { /bin/echo caught }              \
-      ''                                          \
-      getpid    PP                                \
-      foreground importas VAL PP kill -USR1 '$VAL'\
-      ''
-```
+## background
 
-**trap** — install signal handlers in-process.  Syntax: `trap {
-SIGNAME { action... } ... } prog...`.  Signals that arrive during
-the chain are dispatched after it completes.  Each action runs in
-a forked child.
+`background { block } prog...`
 
-```
-  ./execline.c                                    \
-      exit      42
-```
+Fork `block` and run it in the background.  Continue immediately
+with prog.  Sets `!` to the child PID.
 
-**exit** — exit with given code (default 0).
+**Example:** `background { sleep 5 } /bin/echo immediate`
 
-### Information
+## pipeline
 
-```
-  ./execline.c                                    \
-      getpid    MYPID                             \
-      importas  VAL MYPID                         \
-      /bin/echo '$$ = $VAL'
-```
+`pipeline { block } prog...`
 
-**getpid** — store PID into an env var.  `-P` prints it.  `-e` / `-E`
-controls export.
+Run `block` with its stdout connected to prog's stdin.
 
-```
-  ./execline.c                                    \
-      getcwd    MYPATH                            \
-      importas  VAL MYPATH                        \
-      /bin/echo 'cwd = $VAL'
-```
+**Example:** `pipeline { /bin/echo data } tr '[:lower:]' '[:upper:]'`
 
-**getcwd** — store current working directory into env var.
+## piperw
 
-**dollarat** — read positional params (`#`, `1`, `2`, ...) from env,
-print space-separated.  `-d delim` sets delimiter.  `-n` suppresses
-trailing newline.  (run with `env '#=2' '1=a' '2=b'`)
+`piperw r w prog...`
 
-```
-  ./execline.c                                    \
-      eltest    -d /tmp
-```
+Create a pipe.  `r` is set to the read end, `w` to the write end.
+The pipe is kept open while prog runs.
 
-**eltest** — inline POSIX test(1).  No fork.  Supports `-d`, `-e`,
-`-f`, `-n`, `-z`, string `=` / `!=`, numeric `-eq` / `-ne` / `-gt`
-/ `-ge` / `-lt` / `-le`, file age (`-nt`, `-ot`, `-ef`),
-`-a` / `-o`, `( )` grouping.
+**Example:** `piperw 7 8 /bin/echo ok`
 
-```
-  ./execline.c                                    \
-      elglob    FILES '*.c'                       \
-      importas  VAL FILES                         \
-      /bin/echo 'files: $VAL'
-```
+## redirfd
 
-**elglob** — glob a pattern, store space-separated results in env
-var.  `-v` prints.  `-w` uses pattern as-is on no match.
-`-m` allows literal pattern fallback.
+`redirfd [ -r | -w | -a | -u | -x ] [ -n ] [ -b ] fd file prog...`
 
-```
-  ./execline.c                                    \
-      case      hello                             \
-          '*ell*' { /bin/echo matched }           \
-      ''                                          \
-      /bin/echo nomatch
-```
+Open `file` and dup2 it to target `fd`.  Then run prog.
 
-**case** — fnmatch value against patterns in a block.  First match
-runs its action.  `-i` case-insensitive (needs GNU libc).  `-n` inverts.
+- `-r` — open for reading
+- `-w` — open for writing (truncate)
+- `-a` — open for appending
+- `-u` — open for reading and writing
+- `-x` — open for writing, exclusive create (fail if exists)
+- `-n` — set O_NONBLOCK
+- `-b` — toggle blocking (clear O_NONBLOCK)
 
-### Directory and mask
+**Example:** `redirfd -w 1 /tmp/out.txt /bin/echo hello`
 
-```
-  ./execline.c                                    \
-      cd        /tmp                              \
-      getcwd    PWD                               \
-      importas  VAL PWD                           \
-      /bin/echo '$VAL'
-```
+## fdmove
 
-**cd** — chdir + update PWD.  **posix-cd** — chdir only, no PWD
-update.  **umask** — set file creation mask (octal).  **posix-umask**
-— same, no frills.
+`fdmove [ -c ] new old prog...`
 
-### Scripting
+dup2(old, new).  After the move, both fds refer to the same file
+description.
 
-```
-  ./execline.c                                    \
-      execlineb -c 'echo hello world'
-```
+- `-c` — close old fd after the move
 
-**execlineb** — parse execline script text with `{ }` blocks, `""`
-strings, `#` comments, `$@` expansion.  Accepts `-c script` or a
-script file path + args (positional params).
+**Example:** `fdmove 1 2 /bin/echo ok` — redirect stdout to stderr
 
-```
-  ./execline.c                                    \
-      runblock  1                                 \
-          /bin/echo hello                         \
-      ''                                          \
-      world
-```
+## fdclose
+
+`fdclose fd prog...`
+
+Close `fd`.
+
+## fdreserve
+
+`fdreserve fd prog...`
+
+Ensure `fd` is closed, then open /dev/null on it (preventing other
+code from using that fd number).
+
+## fdswap
+
+`fdswap a b prog...`
+
+Swap two fds using an intermediate dup.  After the swap, `a` refers
+to what `b` did and vice versa.
+
+**Example (chained):** `fdreserve 7 fdreserve 8 fdswap 7 8 /bin/echo ok`
+reserves fds 7 and 8, then swaps them.
+
+## fdblock
+
+`fdblock fd prog...`
+
+Clear O_NONBLOCK on `fd` (make it blocking).
+
+## heredoc
+
+`heredoc [ -r | -w ] { content... } '' prog...`
 
-**runblock** — run a block with up to N positional args from prog
-appended.  The rest of prog (beyond N) is the chain.
+Write block content to a temporary file, then feed that file as stdin
+to prog.  Block args (terminated by `''`) are joined with newlines.
+The file is deleted after the child reads it.
 
+- `-r` — feed `/dev/fd/N` instead of a dup'd fd
+- `-w` — open for writing (default: read)
+
+**Example:** `heredoc hello '' tr '[:lower:]' '[:upper:]'`
+
+## withstdinas
+
+`withstdinas file prog...`
+
+Open `file` for reading and dup2 to fd 0 (stdin).
+
+## backtick
+
+`backtick [ -i | -I | -x | -D default ] [ -N | -n ] [ -E | -e ] [ -0 ] var { block } prog...`
+
+Run `block`, capture its stdout, strip trailing newline, store the
+result in environment variable `var`.  Then run prog.
+
+- `-i` — insist on success: error if block fails (default)
+- `-I` — ignore exit status: always use captured output
+- `-x` — accept any exit status, set `?` env var
+- `-D default` — use this value when block fails (implies `-x`)
+- `-N` — don't strip trailing newline
+- `-n` — strip trailing newline (default, no-op flag)
+- `-E` — export var to environment (default)
+- `-e` — don't export var
+- `-0` — null-delimited output
+
+**Example:** `backtick OUTPUT { /bin/echo data } importas VAL OUTPUT /bin/echo '$VAL'`
+
+## forbacktickx
+
+`forbacktickx [ -0 ] [ -o code ] [ -x code ] var { generator } '' loop-body...`
+
+Run `generator`, split its output on newlines (or nulls with `-0`).
+For each value, set `var` and run the loop body.
+
+- `-0` — null-delimited records
+- `-o code` — only iterate if generator exits with code
+- `-x code` — skip iteration if generator exits with code
+
+## forx
+
+`forx var { values... } '' loop-body...`
+
+Iterate over literal values from a block.  Each value sets `var`,
+then runs the loop body.
+
+**Example:** `forx VAR a b '' importas VAL VAR /bin/echo '$VAL'`
+
+## forstdin
+
+`forstdin [ -0 ] [ -w ] [ -W ] var loop-body...`
+
+Read stdin line by line (or null-delimited records with `-0`).
+For each line, set `var` and run the loop body.
+
+- `-w` — strip leading and trailing whitespace from each line
+- `-W` — squeeze internal whitespace
+
+## exec
+
+`exec [ -c ] [ -l ] [ -a argv0 ] program args...`
+
+Replace the current process with `program`.  Does not return.
+
+- `-c` — clear the environment before exec
+- `-l` — prepend `-` to argv[0] (login shell convention)
+- `-a argv0` — set argv[0] explicitly
+
+## tryexec
+
+`tryexec program args...`
+
+Attempt to exec `program`.  If exec fails (program not found, no
+permission, etc.), the chain continues with the remaining argv —
+skipping the failed program and its args.
+
+## wait
+
+`wait [ -t timeout ] [ -I ] { pids... } '' prog...`
+
+Wait for child processes.
+
+- `-t timeout` — use SIGALRM to time out after `timeout` seconds
+- `-I` — silently handle the case of no children (don't error)
+
+Accepts a block of PIDs.  If omitted, waits for all children.
+
+## trap
+
+`trap { name { action... } ... } '' prog...`
+
+Install signal handlers in-process.  Syntax: a block containing
+signal name / action pairs, terminated by `''`.  Signals that arrive
+during prog are dispatched after prog completes.  Each action runs
+in a forked child.
+
+**Example:**
 ```
-  ./execline.c                                    \
-      elgetpositionals MYVAR 1                    \
-      /bin/echo '$MYVAR'
+trap USR1 { /bin/echo caught } '' \
+  getpid PP foreground importas VAL PP kill -USR1 '$VAL' ''
 ```
+
+## exit
+
+`exit [ code ]`
+
+Exit with `code` (default 0).
+
+## getpid
+
+`getpid [ -P ] [ -e | -E ] var prog...`
+
+Store the current process PID into environment variable `var`.
+
+- `-P` — print PID to stdout instead of storing
+- `-e` — export `var` to the environment (default)
+- `-E` — do not export `var` to the environment
+
+**Example:** `getpid MYPID importas VAL MYPID /bin/echo '$$ = $VAL'`
+
+## getcwd
+
+`getcwd var prog...`
+
+Store the current working directory into environment variable `var`.
+
+**Example:** `getcwd MYPATH importas VAL MYPATH /bin/echo 'cwd = $VAL'`
+
+## dollarat
+
+`dollarat [ -d delim ] [ -n ] prog...`
+
+Read positional parameters (`#`, `1`, `2`, ...) from the environment
+and print them space-separated.
+
+- `-d delim` — use `delim` instead of space as separator
+- `-n` — suppress trailing newline
+
+**Example:** `env '#=2' '1=a' '2=b' ./dollarat` prints `a b`
+
+## eltest
+
+`eltest [ -d | -e | -f | -n | -z | cond ] prog...`
+
+Inline POSIX test(1) — no fork.  Supports:
+
+- File tests: `-d file`, `-e file`, `-f file`
+- String tests: `-n str`, `-z str`, `s1 = s2`, `s1 != s2`
+- Numeric tests: `n1 -eq n2`, `-ne`, `-gt`, `-ge`, `-lt`, `-le`
+- File age: `f1 -nt f2`, `f1 -ot f2`, `f1 -ef f2`
+- Connectives: `-a` (and), `-o` (or), `( )` grouping
+
+Sets `?` to 0 if true, 1 if false.  Runs prog only if true.
+
+**Example:** `eltest -d /tmp /bin/echo '/tmp exists'`
+
+## elglob
+
+`elglob [ -v ] [ -w ] [ -m ] var pattern prog...`
+
+Glob `pattern` and store the space-separated results in environment
+variable `var`.
+
+- `-v` — print results to stdout as well
+- `-w` — use pattern literally when no match (no error)
+- `-m` — allow literal pattern as fallback when no match
+
+**Example:** `elglob FILES '*.c' importas VAL FILES /bin/echo 'files: $VAL'`
+
+## case
+
+`case [ -s | -S ] [ -e | -E ] [ -i ] [ -n | -N ] value { pattern { action... } ... } prog...`
+
+Match `value` against patterns inside a block.  The first matching
+pattern runs its action.  If no match, runs prog.
+
+- `-s` — shell glob matching (fnmatch, default)
+- `-S` — extended regex matching
+- `-e` — basic regex (implies `-S`)
+- `-E` — extended regex (default when `-S`)
+- `-i` — case-insensitive matching
+- `-n` — invert: run action on non-match
+- `-N` — enable subexpression capture into `$0`, `$1`, ... (implies `-S`)
+
+**Example:** `case hello '*ell*' { /bin/echo matched } '' /bin/echo nomatch`
+
+## cd
+
+`cd dir prog...`
+
+Change directory to `dir` (chdir) and update the `PWD` environment
+variable.
+
+## posix-cd
+
+`posix-cd dir prog...`
+
+Change directory to `dir` (chdir).  Does not update `PWD`.
+
+## umask
+
+`umask mask prog...`
+
+Set the file creation mask to `mask` (octal).
+
+## posix-umask
+
+`posix-umask mask prog...`
+
+Identical to umask.  Provided for compatibility with skarnet
+execline scripts that call `posix-umask`.
+
+## execlineb
+
+`execlineb [ -c script | file ] args...`
+
+Parse execline script text.  Supports `{ }` blocks, `""` strings,
+`#` comments, and `$@` expansion.  Accepts either `-c script` or a
+script file path followed by positional arguments.
+
+**Example:** `execlineb -c 'echo hello world'`
+
+## runblock
+
+`runblock [ n ] { block } '' prog...`
+
+Run `block` with up to `n` positional arguments from prog appended.
+The rest of prog (beyond `n` args) is the chain that runs after
+the block completes.
+
+**Example:** `runblock 1 /bin/echo hello '' world`
+
+## elgetpositionals
+
+`elgetpositionals [ -D default ] [ -i ] [ -s ] var shift prog...`
+
+Collect positional parameters from environment `$N..$M` (with shift)
+into a variable.  Substitutes `$var` in the remaining argv.
+
+- `-D default` — use this value when shift exceeds available args
+- `-i` — insist: error if shift exceeds available args
+- `-s` — split the value on whitespace
 
-**elgetpositionals** — collect env `$N..$M` (with shift) into a var,
-substitute `$KEY` in remaining argv.  `-D default` when shift exceeds
-args.  `-i` insists.  `-s` splits.  (run with `env '#=3' '1=a'
-'2=b' '3=c'`)
+**Example:** `env '#=3' '1=a' '2=b' '3=c' ./elgetpositionals MYVAR 1`
 
 Usage
 -----
@@ -460,7 +598,7 @@ Usage
   ./export FOO hello /bin/echo '$FOO'
 ```
 
-Compile dep: [ccraft](https://github\.com/snoozelot/ccraft).
+Compile dep: [ccraft](https://github.com/snoozelot/ccraft).
 Standalone: `cc -std=gnu99 -D_GNU_SOURCE execline.c -o execline`.
 
 Design
@@ -490,5 +628,5 @@ References
 
 - [execline](https://skarnet.org/software/execline/) — command
   semantics reference
-- [ccraft](https://github\.com/snoozelot/ccraft) — compile-and-run
+- [ccraft](https://github.com/snoozelot/ccraft) — compile-and-run
   for C

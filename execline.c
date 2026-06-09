@@ -1,91 +1,85 @@
 #!/usr/bin/env -S ccraft -D_GNU_SOURCE
-/* execline — multicall reimplementation of the execline suite
+/* execline — chain-loading command language
  *
  * WHAT IT DOES
- * 46 execline commands in one C file. Compile with ccraft and run via
- *   execline SUBCOMMAND [ARGS...]
- * or via symlinks (define → execline, export → execline, etc.)
+ * Compose environment changes, fd redirections, directory changes,
+ * conditionals, and data capture without subshells or temp files.
+ * Each command sets some state and hands control to the next via
+ * argv — no `;`, `&&`, `||`, or `|` needed.
  *
  * WHY
- * The original execline has 43 separate binaries totaling 843KB.
- * Each command only modifies env/fds/cwd and hands control to the next.
- * The "exec" between commands is an artifact of the multi-binary packaging,
- * not a semantic requirement. A single-binary dispatch preserves the same
- * semantics — each handler returns, and dispatch calls the next.
+ * State flows through argv, not binaries.  No exec between
+ * commands — env, cwd, fds accumulate predictably without
+ * subshells, temp variables, or fork overhead.
  *
  * HOW IT WORKS
- * main() detects invocation mode (symlink or subcommand), then dispatches
- * to the handler for the named command. Handlers consume their args, modify
- * state (setenv, chdir, fork, redirfd, etc.), then call cmd_dispatch() on the
- * remaining argv. cmd_dispatch() dispatches to another handler for known
- * commands, or calls execvp for external programs.
+ * dispatch() picks the next command from argv, calls its handler.
+ * Handlers consume their args, modify state, then call dispatch()
+ * on the remaining argv.  External programs get execvp.
  *
- * The block syntax ({ ... } in execlineb scripts) is parsed into argv as
- * a sequence of args terminated by an empty arg. Args inside blocks are
- * space-prefixed to survive substitution without producing spurious
- * block terminators. read_block() extracts them.
+ * Blocks ({ } in execlineb, flat argv with `''` terminators)
+ * group args for conditionals and data capture.  space-prefixed
+ * per nesting depth so substitution cannot produce terminators.
  *
- * Substitution ($KEY, ${KEY}) is performed by define, importas, elglob,
- * and multisubstitute. The engine replaces occurrences with the value,
- * supports backslash quoting (odd backslash count = literal), and split
- * values (one word per delimiter-separated element).
+ * Substitution ($KEY / ${KEY}) by define, importas, elglob,
+ * multisubstitute.  Backslash quoting, split values, simultaneous.
  *
  * USAGE
- *   execline SUBCOMMAND [ARGS...]
- *   ln -s execline DEFINE; ./DEFINE FOO hello echo $FOO
+ *   execline CMD [ARGS...]
+ *   ln -s execline CMD; ./CMD [ARGS...]
  *
  * EXIT CODES
  *   0   success
  *   100 syntax / usage error
  *   111 temporary failure (out of memory, syscall)
  *   127 command not found / exec failed
- *   other  command-specific (exit code of condition in if/foreground, etc.)
+ *   other  command-specific
  *
- * COMMANDS  (46 implemented)
+ * COMMANDS
  *   backtick        Capture stdout into env var
- *   background      Fork block in background, continue
- *   case            fnmatch against patterns
- *   cd              chdir, update PWD
- *   define          Substitute $KEY for VALUE in remaining argv
- *   dollarat        Print positional parameters
- *   elgetpositionals Substitute $1, $2... from env
+ *   background      Fork block, continue immediately
+ *   case            Match value (fnmatch or regex)
+ *   cd              chdir + update PWD
+ *   define          Substitute $KEY with val in remaining argv
+ *   dollarat        Print positional params
+ *   elgetpositionals Collect env $N..$M into var
  *   elglob          Glob pattern into env var
- *   eltest          Test command
- *   empty           Unset specific env vars
- *   emptyenv        Clear environment
- *   envfile         Load env vars from file
- *   exec            Pass-through (execvp the rest)
- *   execlineb       Script parser for { } syntax
+ *   eltest          Inline POSIX test(1), no fork
+ *   empty           Unset named env vars
+ *   emptyenv        Clear entire environment
+ *   envfile         Load KEY=val from file
+ *   exec            Replace process
+ *   execlineb       Parse execline script text
  *   exit            Exit with code
- *   export          setenv(var, value)
- *   fdblock         Set fd to blocking
- *   fdclose         Close a file descriptor
- *   fdmove          Move fd via dup2
- *   fdreserve       Reserve a file descriptor
- *   fdswap          Swap two file descriptors
+ *   export          setenv(key, val)
+ *   fdblock         Clear O_NONBLOCK on fd
+ *   fdclose         Close fd
+ *   fdmove          dup2(old, new)
+ *   fdreserve       Reserve fd (close, open /dev/null)
+ *   fdswap          Swap two fds
  *   forbacktickx    Iterate over generator output
- *   foreground      Fork block, wait, continue
+ *   foreground      Fork block, wait
  *   forstdin        Iterate over stdin lines
  *   forx            Iterate over literal values
  *   getcwd          Store cwd into env var
  *   getpid          Store PID into env var
- *   heredoc         Feed inline data as stdin
- *   if              Conditional execute
- *   ifelse          Conditional with two chains
- *   ifthenelse      Conditional with three blocks
- *   importas        Import env var with substitution
- *   multidefine     Define multiple keys at once
- *   multisubstitute Multiple simultaneous substitutions
- *   pipeline        Pipe block output into command
+ *   heredoc         Feed string as stdin via pipe
+ *   if              Run chain if block exits 0
+ *   ifelse          Two-branch conditional
+ *   ifthenelse      Two-branch conditional + unconditional rest
+ *   importas        Import env var, substitute $VAR
+ *   multidefine     Define multiple key/val pairs at once
+ *   multisubstitute Multiple substitutions in one pass
+ *   pipeline        Pipe block stdout to next command
  *   piperw          Create pipe at given fds
- *   posix-cd        POSIX-compliant chdir
- *   posix-umask     POSIX-compliant umask
+ *   posix-cd        chdir, no PWD update
+ *   posix-umask     Identical to umask (compat)
  *   redirfd         Redirect fd to file
  *   runblock        Run block with positional args
- *   trap            Signal handling
- *   tryexec         Exec with graceful fallback
+ *   trap            In-process signal handlers
+ *   tryexec         Exec with fallback on failure
  *   umask           Set file creation mask
- *   unexport        unsetenv(var)
+ *   unexport        unsetenv(key)
  *   wait            Wait for children
  *   withstdinas     Open file as stdin
  *
@@ -97,6 +91,7 @@
 #ifndef FNM_CASEFOLD
 #define FNM_CASEFOLD 0   /* non-GNU: no case-insensitive fnmatch */
 #endif
+#include <regex.h>
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
@@ -287,20 +282,6 @@ write_all(int fd, const char *data, size_t len) {
         }
         written += n;
     }
-}
-
-/* Join strings with newlines into an allocated buffer */
-static char *
-join_with_newlines(char **argv, int argc) {
-    size_t total = 0;
-    for (int j = 0; j < argc; j++) total += strlen(argv[j]) + 1;
-    char *data = xmalloc(total + 1);
-    data[0] = '\0';
-    for (int j = 0; j < argc; j++) {
-        strcat(data, argv[j]);
-        strcat(data, "\n");
-    }
-    return data;
 }
 
 /* Join glob results into a space-separated string */
@@ -1253,7 +1234,7 @@ static int cmd_redirfd(int argc, char *argv[]) {
         if (eq(argv[i], "--")) { i++; break; }
         if (eq(argv[i], "-r")) { mode = O_RDONLY; mode_set = true; i++; }
         else if (eq(argv[i], "-w")) { mode = O_WRONLY | O_CREAT | O_TRUNC; mode_set = true; i++; }
-        else if (eq(argv[i], "-u")) { mode = O_RDWR | O_CREAT; mode_set = true; i++; }
+        else if (eq(argv[i], "-u")) { mode = O_RDWR; mode_set = true; i++; }
         else if (eq(argv[i], "-a")) { mode = O_WRONLY | O_CREAT | O_APPEND; mode_set = true; i++; }
         else if (eq(argv[i], "-x")) { mode = O_WRONLY | O_CREAT | O_EXCL; mode_set = true; i++; }
         else if (eq(argv[i], "-n")) { opt_n = true; i++; }
@@ -1283,8 +1264,17 @@ static int cmd_redirfd(int argc, char *argv[]) {
     /* Open the file */
     int newfd = open(file, flags, 0666);
     if (newfd < 0) {
-        fprintf(stderr, "redirfd: unable to open %s: %s\n", file, strerror(errno));
-        return 111;
+        if ((mode & O_WRONLY) && errno == ENXIO) {
+            int tmpfd = open(file, O_RDONLY);
+            if (tmpfd >= 0) {
+                close(tmpfd);
+                newfd = open(file, flags, 0666);
+            }
+        }
+        if (newfd < 0) {
+            fprintf(stderr, "redirfd: unable to open %s: %s\n", file, strerror(errno));
+            return 111;
+        }
     }
 
     /* Handle -b: change blocking mode after open */
@@ -1359,8 +1349,11 @@ static int cmd_background(int argc, char *argv[]) {
          * execvp would require symlinks — dispatch works
          * for both builtins and external commands. */
         if (opt_d) {
-            /* Detach: new session */
-            setsid();
+            /* Detach: double-fork so grandchild is orphaned and
+             * reaped by init — no zombie, no wait needed. */
+            pid_t pid2 = fork();
+            if (pid2 < 0) _exit(111);
+            if (pid2 > 0) _exit(0);
         }
         if (block_argc > 0)
             _exit(cmd_dispatch(block_argc, block_argv));
@@ -1369,12 +1362,14 @@ static int cmd_background(int argc, char *argv[]) {
 
     free_block(block_argc, block_argv);
 
-    /* Set ! environment variable to the child PID */
-    char pid_str[16];
-    snprintf(pid_str, sizeof(pid_str), "%d", (int)pid);
-    setenv("!", pid_str, 1);
+    if (opt_d) {
+        waitpid(pid, NULL, 0);
+    } else {
+        char pid_str[16];
+        snprintf(pid_str, sizeof(pid_str), "%d", (int)pid);
+        setenv("!", pid_str, 1);
+    }
 
-    /* Run the rest */
     int rest_argc = argc - end;
     return cmd_dispatch(rest_argc, argv + end);
 }
@@ -1391,41 +1386,30 @@ pipe_has_read(int pipe_end) {
     return pipe_end == -1 || pipe_end == 0;
 }
 
-/* Evaluate exit condition with -t/-x/-n flags */
-static int
-evaluate_condition(int status, int opt_t, int opt_x, int opt_n, int opt_code) {
-    if (opt_t) return status == opt_code;
-    if (opt_x) return status != opt_code;
-    if (opt_n) return status != 0;
-    return status == 0;
-}
-
 /* --- if --- */
 static int cmd_if(int argc, char *argv[]) {
-    /* if [ -X ] [ -n ] [ -t | -x exitcode ] { prog1... } prog2... */
-    bool opt_X = false;
+    /* if [ -n ] [ -X ] [ -t | -x exitcode ] { prog1... } prog2...
+     *
+     * Per skarnet semantics:
+     *   -n   invert condition (succeed on non-zero exit)
+     *   -X   don't crash when child killed by signal (no-op)
+     *   -t   on failure, exit 0 instead of child's exit code
+     *   -x code  on failure, exit code instead of child's exit code */
     bool opt_n = false;
-    bool opt_t = false;    /* -t: true when status == code */
-    bool opt_x = false;    /* -x: true when status != code */
-    int opt_code = -1;     /* exit code for -t/-x */
+    bool opt_X = false;
+    int fail_code = -1;  /* -1 = child exit, 0 = -t, N = -x N */
     int i = 1;
 
     while (i < argc && is_opt(argv[i])) {
         if (eq(argv[i], "--")) { i++; break; }
-        if (eq(argv[i], "-X")) { opt_X = true; i++; }
-        else if (eq(argv[i], "-n")) { opt_n = true; i++; }
-        else if (eq(argv[i], "-t") && i+1 < argc) {
-            bool ok;
-            opt_code = parse_int(argv[i+1], &ok);
-            if (!ok) { fprintf(stderr, "if: invalid exit code: %s\n", argv[i+1]); return 100; }
-            opt_t = true;
-            i += 2;
-        }
+        if (eq(argv[i], "-n")) { opt_n = true; i++; }
+        else if (eq(argv[i], "-X")) { opt_X = true; i++; }
+        else if (eq(argv[i], "-t")) { fail_code = 0; i++; }
         else if (eq(argv[i], "-x") && i+1 < argc) {
             bool ok;
-            opt_code = parse_int(argv[i+1], &ok);
+            int code = parse_int(argv[i+1], &ok);
             if (!ok) { fprintf(stderr, "if: invalid exit code: %s\n", argv[i+1]); return 100; }
-            opt_x = true;
+            fail_code = code;
             i += 2;
         }
         else break;
@@ -1440,11 +1424,10 @@ static int cmd_if(int argc, char *argv[]) {
     int status = run_block(block_argc, block_argv);
     free_block(block_argc, block_argv);
 
-    /* Set ? environment variable */
     set_status_var(status);
+    (void)opt_X;
 
-    bool condition_true = evaluate_condition(status, opt_t, opt_x, opt_n, opt_code);
-    if (opt_X) condition_true = !condition_true;
+    bool condition_true = (status == 0) ? !opt_n : opt_n;
 
     int rest_argc = argc - end;
 
@@ -1452,7 +1435,7 @@ static int cmd_if(int argc, char *argv[]) {
         return cmd_dispatch(rest_argc, argv + end);
     }
 
-    /* Condition false: skip the rest, just exit with the test's exit code */
+    if (fail_code >= 0) return fail_code;
     return status;
 }
 
@@ -1485,8 +1468,8 @@ static int cmd_ifelse(int argc, char *argv[]) {
 
     set_status_var(condition_status);
 
-    bool condition_true = evaluate_condition(condition_status, 0, 0, opt_n, 0);
-    if (opt_X) condition_true = !condition_true;
+    bool condition_true = (condition_status == 0) ? !opt_n : opt_n;
+    (void)opt_X;
 
     int rest_argc = argc - then_end;
     char **rest_argv = argv + then_end;
@@ -1560,7 +1543,7 @@ static int cmd_ifthenelse(int argc, char *argv[]) {
     free_block(cond_argc, cond_argv);
 
     bool condition_true = (condition_status == 0);
-    if (opt_X) condition_true = !condition_true;
+    (void)opt_X;
 
     if (opt_s) set_status_var(condition_status);
 
@@ -1625,21 +1608,19 @@ static int cmd_pipeline(int argc, char *argv[]) {
 
     int rest_argc = argc - left_end;
 
-    if (opt_d) {
-        /* Detach: don't wait for the left command */
-        return cmd_dispatch(rest_argc, argv + left_end);
+    /* Store child PID in ! unless -d (detached) */
+    if (!opt_d) {
+        char pid_str[32];
+        snprintf(pid_str, sizeof(pid_str), "%d", pid);
+        setenv("!", pid_str, 1);
     }
 
-    /* Default: wait for the left command */
-    int status;
-    waitpid(pid, &status, 0);
+    int status = cmd_dispatch(rest_argc, argv + left_end);
 
-    char status_str[16];
-    snprintf(status_str, sizeof(status_str), "%d",
-             waitstatus_exit_code(status));
-    setenv("?", status_str, 1);
+    /* Reap the child (non-blocking -- should already be done) */
+    waitpid(pid, NULL, WNOHANG);
 
-    return cmd_dispatch(rest_argc, argv + left_end);
+    return status;
 }
 
 /* --- piperw --- */
@@ -1739,27 +1720,26 @@ static int cmd_getpid(int argc, char *argv[]) {
 
 /* --- backtick --- */
 static int cmd_backtick(int argc, char *argv[]) {
-    /* backtick [ -i | -I | -x | -D default ] [ -N | -n ] [ -E | -e ] [ -0 ]
+    /* backtick [ -i | -I | -x | -D default ] [ -N ] [ -E | -e ] [ -0 ]
      *         var { prog1... } prog2... */
-    bool opt_n = false;
+    int insist = 2;  /* 2 = error on failure, 1 = accept exit, 0 = ignore */
     const char *opt_D = NULL;
-    bool opt_i = false;
-    bool opt_x = false;
-    bool opt_I = false;
-    bool opt_0 = false;     /* -0: null-delimited output */
-    bool do_export = true;  /* -E: export (default), -e: no export */
+    bool opt_N = false;
+    bool opt_0 = false;
+    bool do_export = true;
     int i = 1;
 
     while (i < argc && is_opt(argv[i])) {
         if (eq(argv[i], "--")) { i++; break; }
-        if (eq(argv[i], "-n") || eq(argv[i], "-N")) { opt_n = true; i++; }
+        if (eq(argv[i], "-N")) { opt_N = true; i++; }
+        else if (eq(argv[i], "-n")) { i++; }
         else if (eq(argv[i], "-E")) { do_export = true; i++; }
         else if (eq(argv[i], "-e")) { do_export = false; i++; }
-        else if (eq(argv[i], "-i")) { opt_i = true; i++; }
-        else if (eq(argv[i], "-I")) { opt_I = true; i++; }
-        else if (eq(argv[i], "-x")) { opt_x = true; i++; }
+        else if (eq(argv[i], "-i")) { insist = 2; i++; }
+        else if (eq(argv[i], "-I")) { insist = 0; i++; }
+        else if (eq(argv[i], "-x")) { insist = 1; opt_D = NULL; i++; }
         else if (eq(argv[i], "-0")) { opt_0 = true; i++; }
-        else if (eq(argv[i], "-D") && i+1 < argc) { opt_D = argv[i+1]; i += 2; }
+        else if (eq(argv[i], "-D") && i+1 < argc) { insist = 1; opt_D = argv[i+1]; i += 2; }
         else break;
     }
 
@@ -1783,38 +1763,31 @@ static int cmd_backtick(int argc, char *argv[]) {
 
     set_status_var(exit_code);
 
-    /* Handle -x: fail if subprocess succeeds */
-    if (opt_x && exit_code == 0) {
-        free(output);
-        free_block(block_argc, block_argv);
-        return 100;
-    }
+    char *value;
+    char empty_str[] = "";
+    bool use_output = false;
 
-    /* Handle -i: fail if subprocess fails (unless -I which captures excerpt) */
-    if (exit_code != 0 && opt_i && !opt_I) {
+    if (exit_code == 0) {
+        use_output = true;
+    } else if (insist == 0) {
+        use_output = true;
+    } else if (insist == 1) {
+        use_output = opt_D ? false : true;
+    } else {
         fprintf(stderr, "backtick: command failed with exit code %d\n", exit_code);
         free(output);
         free_block(block_argc, block_argv);
         return 100;
     }
 
-    /* Determine value: use output on success, or -I excerpt on failure.
-     * Always own a writable copy — opt_D points to argv which may be
-     * read-only (const-qualified platforms). */
-    char *value;
-    char empty_str[] = "";
-    if (output && (exit_code == 0 || opt_I))
+    if (output && use_output)
         value = output;
     else if (opt_D)
         value = xstrdup(opt_D);
     else
         value = empty_str;
 
-    /* Strip trailing delimiter.
-     * -0: null-delimited, strip trailing nulls.
-     * default: newline-delimited, strip trailing newlines.
-     * -n/-N: don't strip. */
-    if (!opt_n) {
+    if (!opt_N && value != empty_str) {
         size_t len = strlen(value);
         char delim = opt_0 ? '\0' : '\n';
         while (len > 0 && value[len-1] == delim)
@@ -2035,17 +2008,22 @@ static int cmd_elglob(int argc, char *argv[]) {
 /* --- case --- */
 static int cmd_case(int argc, char *argv[]) {
     /* case [ -S | -s ] [ -E | -e ] [ -i ] [ -n | -N ] value { pattern { prog... } ... } */
-    bool opt_i = false;  /* -i: case insensitive */
-    bool opt_n = false;  /* -n: negate */
+    int mode = 0;       /* 0 = shell, 1 = regex */
+    int regex_flags = REG_EXTENDED;
+    bool opt_i = false;
+    bool opt_n = false;
+    bool opt_capture = false;
     int i = 1;
 
     while (i < argc && is_opt(argv[i])) {
         if (eq(argv[i], "--")) { i++; break; }
         if (eq(argv[i], "-i")) { opt_i = true; i++; }
         else if (eq(argv[i], "-n")) { opt_n = true; i++; }
-        else if (eq(argv[i], "-N")) { opt_n = false; i++; }
-        else if (eq(argv[i], "-S") || eq(argv[i], "-s")) { i++; }
-        else if (eq(argv[i], "-E") || eq(argv[i], "-e")) { i++; }
+        else if (eq(argv[i], "-N")) { opt_n = false; opt_capture = true; mode = 1; i++; }
+        else if (eq(argv[i], "-s")) { mode = 0; i++; }
+        else if (eq(argv[i], "-S")) { mode = 1; i++; }
+        else if (eq(argv[i], "-E")) { regex_flags = REG_EXTENDED; mode = 1; i++; }
+        else if (eq(argv[i], "-e")) { regex_flags = 0; mode = 1; i++; }
         else break;
     }
 
@@ -2055,6 +2033,7 @@ static int cmd_case(int argc, char *argv[]) {
     }
 
     const char *value = argv[i]; i++;
+    if (opt_i) regex_flags |= REG_ICASE;
 
     /* Read the outer block containing pattern/block pairs */
     int block_argc;
@@ -2074,16 +2053,67 @@ static int cmd_case(int argc, char *argv[]) {
         read_block(block_argc, block_argv, bi, &cmd_argc, &cmd_argv, &cmd_end);
         bi = cmd_end;  /* advance past the block */
 
-        int flags = 0;
-        if (opt_i) flags |= FNM_CASEFOLD;
+        int this_match = 0;
 
-        if (fnmatch(pattern, value, flags) == 0) {
-            matched = 1;
-            if (opt_n) {
-                /* -n: negate — execute on non-match, so this match means skip */
+        if (mode == 0) {
+            int fnflags = 0;
+            if (opt_i) fnflags |= FNM_CASEFOLD;
+            this_match = (fnmatch(pattern, value, fnflags) == 0);
+        } else {
+            regex_t re;
+            char expr[strlen(pattern) + 3];
+            expr[0] = '^';
+            memcpy(expr + 1, pattern, strlen(pattern));
+            expr[1 + strlen(pattern)] = '$';
+            expr[2 + strlen(pattern)] = 0;
+            int r = regcomp(&re, expr, regex_flags);
+            if (r) {
+                char buf[256];
+                regerror(r, &re, buf, sizeof(buf));
+                fprintf(stderr, "case: invalid regex '%s': %s\n", pattern, buf);
                 free_block(cmd_argc, cmd_argv);
-                continue;
+                free_block(block_argc, block_argv);
+                return 100;
             }
+            if (opt_capture) {
+                size_t nmatch = re.re_nsub + 1;
+                regmatch_t pmatch[nmatch];
+                r = regexec(&re, value, nmatch, pmatch, 0);
+                if (!r) {
+                    this_match = 1;
+                    char nstr[16];
+                    snprintf(nstr, sizeof(nstr), "%zu", nmatch - 1);
+                    setenv("#", nstr, 1);
+                    size_t len = pmatch[0].rm_eo - pmatch[0].rm_so;
+                    char full[len + 1];
+                    memcpy(full, value + pmatch[0].rm_so, len);
+                    full[len] = 0;
+                    setenv("0", full, 1);
+                    for (size_t j = 1; j < nmatch; j++) {
+                        char vn[24];
+                        snprintf(vn, sizeof(vn), "%zu", j);
+                        if (pmatch[j].rm_so >= 0) {
+                            size_t clen = pmatch[j].rm_eo - pmatch[j].rm_so;
+                            char cap[clen + 1];
+                            memcpy(cap, value + pmatch[j].rm_so, clen);
+                            cap[clen] = 0;
+                            setenv(vn, cap, 1);
+                        } else {
+                            setenv(vn, "", 1);
+                        }
+                    }
+                }
+            } else {
+                r = regexec(&re, value, 0, NULL, 0);
+                this_match = (r == 0);
+            }
+            regfree(&re);
+        }
+
+        if (opt_n) this_match = !this_match;
+
+        if (this_match) {
+            matched = 1;
             if (cmd_argc > 0) {
                 int status = run_block(cmd_argc, cmd_argv);
                 free_block(cmd_argc, cmd_argv);
@@ -2098,7 +2128,6 @@ static int cmd_case(int argc, char *argv[]) {
 
     free_block(block_argc, block_argv);
 
-    /* Fall through to the rest of argv after the block */
     return cmd_dispatch(argc - block_end, argv + block_end);
 }
 
@@ -3361,56 +3390,60 @@ cmd_elgetpositionals(int argc, char *argv[]) {
 
 static int
 cmd_heredoc(int argc, char *argv[]) {
-    /* heredoc [ -r | -w ] { data... } prog... */
-    bool opt_r = false;
+    /* heredoc [ -d ] fd string prog...
+     * Skarnet-compatible: pipe-based, no temp file. */
+    bool opt_d = false;
     int i = 1;
     while (i < argc && is_opt(argv[i])) {
-        if (eq(argv[i], "-r")) { opt_r = true; i++; }
-        else if (eq(argv[i], "-w")) { i++; }
+        if (eq(argv[i], "--")) { i++; break; }
+        if (eq(argv[i], "-d")) { opt_d = true; i++; }
         else break;
     }
 
-    int data_argc; char **data_argv; int data_end;
-    read_block(argc, argv, i, &data_argc, &data_argv, &data_end);
-
-    char *data = join_with_newlines(data_argv, data_argc);
-    size_t datalen = strlen(data);
-
-    char tmpname[] = "/tmp/execline-heredoc-XXXXXX";
-    int tmpfd = mkstemp(tmpname);
-    if (tmpfd < 0) die_sys();
-    unlink(tmpname);
-
-    write_all(tmpfd, data, datalen);
-    if (lseek(tmpfd, 0, SEEK_SET) < 0) die_sys();
-
-    pid_t pid = fork_or_die();
-
-    if (pid == 0) {
-        int child_fd;
-        if (opt_r) {
-            char fdpath[32];
-            snprintf(fdpath, sizeof(fdpath), "/dev/fd/%d", tmpfd);
-            child_fd = open(fdpath, O_RDONLY);
-        } else {
-            child_fd = dup(tmpfd);
-        }
-        if (child_fd < 0) _exit(111);
-        if (dup2(child_fd, 0) < 0) _exit(111);
-        close(child_fd);
-        close(tmpfd);
-        free(data);
-        free_block(data_argc, data_argv);
-        _exit(cmd_dispatch(argc - data_end, argv + data_end));
+    if (i + 2 >= argc) {
+        fprintf(stderr, "heredoc: usage: heredoc [ -d ] fd string prog...\n");
+        return 100;
     }
 
-    close(tmpfd);
-    free(data);
-    free_block(data_argc, data_argv);
+    bool ok;
+    int target_fd = parse_int(argv[i], &ok);
+    if (!ok || target_fd < 0) {
+        fprintf(stderr, "heredoc: invalid fd: %s\n", argv[i]);
+        return 100;
+    }
+    const char *data = argv[i + 1];
+    int prog_start = i + 2;
 
-    int status;
-    waitpid(pid, &status, 0);
-    return waitstatus_exit_code(status);
+    int pfd[2];
+    if (pipe(pfd) < 0) die_sys();
+
+    pid_t pid = fork();
+    if (pid < 0) die_sys();
+    if (pid == 0) {
+        if (opt_d) {
+            pid_t pid2 = fork();
+            if (pid2 < 0) _exit(111);
+            if (pid2 > 0) _exit(0);
+        }
+        close(pfd[0]);
+        write_all(pfd[1], data, strlen(data));
+        close(pfd[1]);
+        _exit(0);
+    }
+
+    close(pfd[1]);
+    if (dup2(pfd[0], target_fd) < 0) {
+        fprintf(stderr, "heredoc: dup2: %s\n", strerror(errno));
+        close(pfd[0]);
+        return 111;
+    }
+    close(pfd[0]);
+
+    int wstatus;
+    waitpid(pid, &wstatus, 0);
+    set_status_var(waitstatus_exit_code(wstatus));
+
+    return cmd_dispatch(argc - prog_start, argv + prog_start);
 }
 
 /* ------------------------------------------------------------------ */
@@ -3554,20 +3587,57 @@ cmd_empty(int argc, char *argv[]) {
 /* Parse envfile lines into setenv calls */
 static void
 parse_env_lines(FILE *f, int opt_n, int opt_i, int opt_I) {
-    char line[4096];
-    while (fgets(line, sizeof(line), f)) {
-        size_t len = strlen(line);
-        if (len > 0 && line[len-1] == '\n') line[len-1] = '\0';
-        if (!*line || *line == '#') continue;
+    char buf[65536];
+    size_t pos = 0;
+    int ch;
+    while ((ch = fgetc(f)) != EOF) {
+        if (ch == '\\') {
+            int next = fgetc(f);
+            if (next == '\n') continue;
+            if (next != EOF) {
+                if (pos < sizeof(buf) - 1) buf[pos++] = '\\';
+                if (pos < sizeof(buf) - 1) buf[pos++] = next;
+            }
+        } else {
+            if (pos < sizeof(buf) - 1) buf[pos++] = ch;
+        }
+    }
+    buf[pos] = '\0';
+
+    char *line = buf;
+    while (line && *line) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl++ = '\0'; else nl = NULL;
+        while (*line == ' ' || *line == '\t') line++;
+        if (!*line || *line == '#') { line = nl; continue; }
+
+        char in_q = 0;
+        char *p = line;
+        while (*p) {
+            if (*p == '"' && in_q != '\'') in_q = in_q ? 0 : '"';
+            else if (*p == '\'' && in_q != '"') in_q = in_q ? 0 : '\'';
+            else if (*p == '#' && !in_q) { *p = '\0'; break; }
+            p++;
+        }
+
         char *eqp = strchr(line, '=');
         if (eqp) {
             *eqp = '\0';
-            if (!opt_n) setenv(line, eqp + 1, 1);
-        } else if (!opt_I && !opt_i) {
+            char *val = eqp + 1;
+            char *k = line + strlen(line);
+            while (k > line && (k[-1] == ' ' || k[-1] == '\t')) k--;
+            *k = '\0';
+            size_t vlen = strlen(val);
+            if (vlen >= 2 && ((val[0] == '"' && val[vlen-1] == '"') ||
+                              (val[0] == '\'' && val[vlen-1] == '\''))) {
+                val[vlen-1] = '\0';
+                val++;
+            }
+            if (*line && !opt_n) setenv(line, val, 1);
+        } else if (!opt_I) {
             fprintf(stderr, "envfile: ignoring malformed line: %s\n", line);
         }
-        if (opt_i && !eqp)
-            fprintf(stderr, "envfile: malformed line (no '='): %s\n", line);
+        line = nl;
     }
 }
 
@@ -3593,27 +3663,37 @@ read_envfile(const char *path, int opt_n, int opt_i, int opt_I) {
 
 static int
 cmd_envfile(int argc, char *argv[]) {
-    /* envfile [ -i ] [ -I ] [ -f file | -e | -n ] prog... */
+    /* envfile [ -i | -I ] [ file ] prog...
+     * -i  error if file missing (default)
+     * -I  silently skip if file missing
+     * If file is "-", read from stdin. */
+    bool opt_i = true;
+    bool opt_I = false;
+    int opt_n = 0;
     const char *filepath = NULL;
-    bool opt_i = false, opt_I = false;
-    bool opt_e = false, opt_n = false;
     int i = 1;
 
     while (i < argc && is_opt(argv[i])) {
-        if (eq(argv[i], "-i")) { opt_i = true; i++; }
-        else if (eq(argv[i], "-I")) { opt_I = true; i++; }
-        else if (eq(argv[i], "-f") && i+1 < argc) { filepath = argv[i+1]; i += 2; }
-        else if (eq(argv[i], "-e")) { opt_e = true; i++; }
-        else if (eq(argv[i], "-n")) { opt_n = true; i++; }
+        if (eq(argv[i], "-i")) { opt_i = true; opt_I = false; i++; }
+        else if (eq(argv[i], "-I")) { opt_I = true; opt_i = false; i++; }
+        else if (eq(argv[i], "-n")) { opt_n = 1; i++; }
         else break;
     }
 
-    if (!filepath && !opt_e) filepath = "env";
-
-    if (filepath) {
-        int err = read_envfile(filepath, opt_n, opt_i, opt_I);
-        if (err) return err;
+    if (i < argc && !is_opt(argv[i]) && strchr(argv[i], '=') == NULL) {
+        filepath = argv[i]; i++;
     }
+
+    if (!filepath) filepath = "env";
+
+    int err;
+    if (eq(filepath, "-")) {
+        parse_env_lines(stdin, opt_n, opt_i, opt_I);
+        err = 0;
+    } else {
+        err = read_envfile(filepath, opt_n, opt_i, opt_I);
+    }
+    if (err) return err;
 
     return cmd_dispatch(argc - i, argv + i);
 }
